@@ -4,7 +4,6 @@ services:
     image: ghcr.io/getzep/postgres:latest
     container_name: zep-postgres
     restart: on-failure
-    shm_size: "128mb"  # Increase this if vacuuming fails with a "no space left on device" error
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
@@ -13,13 +12,13 @@ services:
       dockerfile: Dockerfile.postgres
     networks:
       - zep-network
-    volumes:
-      - zep-db:/var/lib/postgresql/data
     healthcheck:
       test: [ "CMD", "pg_isready", "-q", "-d", "postgres", "-U", "postgres" ]
       interval: 5s
       timeout: 5s
       retries: 5
+    ports:
+      - "5432:5432"
   nlp:
     image: ghcr.io/getzep/zep-nlp-server:latest
     container_name: zep-nlp
@@ -34,6 +33,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 45s
+    ports:
+      - "5557:5557"
   zep:
     image: ghcr.io/getzep/zep:latest
     container_name: zep
@@ -54,8 +55,7 @@ services:
       - ZEP_EXTRACTORS_DOCUMENTS_EMBEDDINGS_DIMENSIONS=1536
       - ZEP_EXTRACTORS_MESSAGES_EMBEDDINGS_SERVICE=openai
       - ZEP_EXTRACTORS_MESSAGES_EMBEDDINGS_DIMENSIONS=1536
-      - ZEP_EXTRACTORS_MESSAGES_SUMMARIZER_EMBEDDINGS_SERVICE=openai
-      - ZEP_EXTRACTORS_MESSAGES_SUMMARIZER_EMBEDDINGS_DIMENSIONS=1536
+      - ZEP_SERVER_WEB_ENABLED=true
     env_file:
       - .env # Store your OpenAI API key here as ZEP_OPENAI_API_KEY
     build:
@@ -72,5 +72,4 @@ services:
 networks:
   zep-network:
     driver: bridge
-volumes:
-  zep-db:
+
