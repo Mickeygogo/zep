@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/getzep/zep/pkg/store"
 
@@ -14,21 +15,26 @@ import (
 	"github.com/uptrace/bun"
 )
 
-const DefaultDocEmbeddingChunkSize = 1000
-
 // NewDocumentStore returns a new DocumentStore. Use this to correctly initialize the store.
 func NewDocumentStore(
-	ctx context.Context,
 	appState *models.AppState,
 	client *bun.DB,
+	docEmbeddingUpdateTaskCh chan []models.DocEmbeddingUpdate,
+	docEmbeddingTaskCh chan<- []models.DocEmbeddingTask,
 ) (*DocumentStore, error) {
 	if appState == nil {
 		return nil, errors.New("nil appState received")
 	}
 
+	// Create context that we'll use to shut down the document embedding updater
+	ctx, done := context.WithCancel(context.Background())
 	ds := &DocumentStore{
 		store.BaseDocumentStore[*bun.DB]{Client: client},
 		appState,
+		docEmbeddingUpdateTaskCh,
+		docEmbeddingTaskCh,
+		done,
+		sync.Once{},
 	}
 
 	err := ds.OnStart(ctx)
@@ -39,20 +45,36 @@ func NewDocumentStore(
 	return ds, nil
 }
 
+// Force compiler to validate that DocumentStore implements the DocumentStore interface.
 var _ models.DocumentStore[*bun.DB] = &DocumentStore{}
 
 type DocumentStore struct {
 	store.BaseDocumentStore[*bun.DB]
-	appState *models.AppState
+	appState                 *models.AppState
+	DocEmbeddingUpdateTaskCh chan []models.DocEmbeddingUpdate
+	DocEmbeddingTaskCh       chan<- []models.DocEmbeddingTask
+	done                     context.CancelFunc
+	startOnce                sync.Once
 }
 
 func (ds *DocumentStore) OnStart(
-	_ context.Context,
+	ctx context.Context,
 ) error {
+	// start the document embedding updater in a goroutine
+	ds.startOnce.Do(func() {
+		go func() {
+			log.Info("starting document embedding updater")
+			err := ds.documentEmbeddingUpdater(ctx)
+			if err != nil {
+				log.Errorf("Error from document embedding updater: %v", err)
+			}
+		}()
+	})
 	return nil
 }
 
 func (ds *DocumentStore) Shutdown(_ context.Context) error {
+	ds.done()
 	return nil
 }
 
@@ -69,7 +91,7 @@ func (ds *DocumentStore) CreateCollection(
 	dbCollection.db = ds.Client
 	err := dbCollection.Create(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to create collection: %w", err)
+		return fmt.Errorf("failed to Create collection: %w", err)
 	}
 	return nil
 }
@@ -84,7 +106,7 @@ func (ds *DocumentStore) UpdateCollection(
 	dbCollection := NewDocumentCollectionDAO(ds.appState, ds.Client, collection)
 	err := dbCollection.Update(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to update collection: %w", err)
+		return fmt.Errorf("failed to Update collection: %w", err)
 	}
 	return nil
 }
@@ -186,14 +208,14 @@ func (ds *DocumentStore) CreateDocuments(
 		)
 	}
 	if !collection.IsAutoEmbedded && someEmpty {
-		return nil, models.NewBadRequestError(
+		return nil, errors.New(
 			"cannot create documents without embeddings in a non-auto-embedded collection",
 		)
 	}
 
 	uuids, err := collection.CreateDocuments(ctx, documents)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create documents: %w", err)
+		return nil, fmt.Errorf("failed to Create documents: %w", err)
 	}
 
 	// if the collection is configured to auto-embed, send the documents
@@ -242,7 +264,7 @@ func (ds *DocumentStore) GetDocuments(
 	)
 	documents, err := dbCollection.GetDocuments(ctx, 0, uuids, documentIDs)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get documents: %w", err)
+		return nil, fmt.Errorf("failed to get document: %w", err)
 	}
 
 	return documents, nil
@@ -273,6 +295,7 @@ func (ds *DocumentStore) SearchCollection(
 	ctx context.Context,
 	query *models.DocumentSearchPayload,
 	limit int,
+	withMMR bool,
 	pageNumber int,
 	pageSize int,
 ) (*models.DocumentSearchResultPage, error) {
@@ -282,7 +305,7 @@ func (ds *DocumentStore) SearchCollection(
 		models.DocumentCollection{Name: query.CollectionName},
 	)
 
-	results, err := collectionDAO.SearchDocuments(ctx, query, limit, pageNumber, pageSize)
+	results, err := collectionDAO.SearchDocuments(ctx, query, limit, withMMR, pageNumber, pageSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search collection: %w", err)
 	}
@@ -306,15 +329,6 @@ func (ds *DocumentStore) CreateCollectionIndex(
 		return fmt.Errorf("failed to get collection: %w", err)
 	}
 
-	if collection.IndexType != "ivfflat" {
-		log.Warningf(
-			"collection %s is of type %s, which is not supported for manual indexing",
-			collection.Name,
-			collection.IndexType,
-		)
-		return nil
-	}
-
 	vci, err := NewVectorColIndex(ctx, ds.appState, collection.DocumentCollection)
 	if err != nil {
 		return fmt.Errorf("failed to create vector column index: %w", err)
@@ -336,41 +350,60 @@ func (ds *DocumentStore) documentEmbeddingTasker(
 	tasks := make([]models.DocEmbeddingTask, len(documents))
 	for i := range documents {
 		tasks[i] = models.DocEmbeddingTask{
-			UUID: documents[i].UUID,
+			UUID:           documents[i].UUID,
+			Content:        documents[i].Content,
+			CollectionName: collectionName,
 		}
 	}
 
-	// chunk the tasks into groups of taskChunkSize
-	taskChunkSize := DefaultDocEmbeddingChunkSize
-	tmpChunkSize := ds.appState.Config.Extractors.Documents.Embeddings.ChunkSize
-	if tmpChunkSize > 0 {
-		taskChunkSize = tmpChunkSize
-	}
-	taskChunks := chunkTasks(tasks, taskChunkSize)
+	log.Infof("sending %d documents to document embedding updater", len(tasks))
+	ds.DocEmbeddingTaskCh <- tasks
+}
 
-	for _, taskChunk := range taskChunks {
-		err := ds.appState.TaskPublisher.Publish(
-			"document_embedder",
-			map[string]string{
-				"collection_name": collectionName,
-			},
-			taskChunk,
-		)
-		if err != nil {
-			log.Errorf("failed to publish document embedding task: %v", err)
+func (ds *DocumentStore) documentEmbeddingUpdater(
+	ctx context.Context,
+) error {
+	defer close(ds.DocEmbeddingUpdateTaskCh)
+	log.Info("started document embedding updater")
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("document embedding updater shutting down")
+			return nil
+		case updates := <-ds.DocEmbeddingUpdateTaskCh:
+			log.Debug("document embedding updater received update task")
+			if len(updates) == 0 {
+				log.Warning("document embedding updater received empty update list")
+			}
+			log.Debugf("document embedding updater received %d updates", len(updates))
+			dbCollection := NewDocumentCollectionDAO(
+				ds.appState,
+				ds.Client,
+				// TODO: this assumption is hacky. Fix this.
+				models.DocumentCollection{Name: updates[0].CollectionName},
+			)
+			docs := documentsFromEmbeddingUpdates(updates)
+			err := dbCollection.UpdateDocuments(ctx, docs)
+			if err != nil {
+				log.Errorf("failed to update document embedding: %s", err)
+			}
+
+			log.Debugf("Document embedding updater updated %d documents", len(updates))
 		}
 	}
 }
 
-// chunkTasks splits the given tasks into chunks of the given size.
-func chunkTasks(tasks []models.DocEmbeddingTask, chunkSize int) [][]models.DocEmbeddingTask {
-	var chunks [][]models.DocEmbeddingTask
-	for i := 0; i < len(tasks); i += chunkSize {
-		end := i + chunkSize
-		if end > len(tasks) {
-			end = len(tasks)
+func documentsFromEmbeddingUpdates(updates []models.DocEmbeddingUpdate) []models.Document {
+	docs := make([]models.Document, len(updates))
+	for i := range updates {
+		d := models.Document{
+			DocumentBase: models.DocumentBase{
+				UUID:       updates[i].UUID,
+				IsEmbedded: true,
+			},
+			Embedding: updates[i].Embedding,
 		}
-		chunks = append(chunks, tasks[i:end])
+		docs[i] = d
 	}
-	return chunks
+	return docs
 }

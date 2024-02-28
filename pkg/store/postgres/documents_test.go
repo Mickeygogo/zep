@@ -3,6 +3,9 @@ package postgres
 import (
 	"context"
 	"testing"
+	"time"
+
+	"github.com/getzep/zep/pkg/extractors"
 
 	"github.com/getzep/zep/pkg/models"
 
@@ -29,7 +32,7 @@ func TestCollectionCreate(t *testing.T) {
 	ctx := context.Background()
 
 	CleanDB(t, testDB)
-	err := CreateSchema(ctx, appState, testDB)
+	err := ensurePostgresSetup(ctx, appState, testDB)
 	assert.NoError(t, err)
 
 	collection := NewTestCollectionDAO(10)
@@ -67,7 +70,7 @@ func TestCollectionUpdate(t *testing.T) {
 	ctx := context.Background()
 
 	CleanDB(t, testDB)
-	err := CreateSchema(ctx, appState, testDB)
+	err := ensurePostgresSetup(ctx, appState, testDB)
 	assert.NoError(t, err)
 
 	collection := NewTestCollectionDAO(10)
@@ -84,14 +87,13 @@ func TestCollectionUpdate(t *testing.T) {
 	err = collection.GetByName(ctx)
 	assert.NoError(t, err)
 	assert.Equal(t, expectedDimensions, collection.EmbeddingDimensions)
-	assert.Less(t, collection.CreatedAt, collection.UpdatedAt)
 }
 
 func TestCollectionGetByName(t *testing.T) {
 	ctx := context.Background()
 
 	CleanDB(t, testDB)
-	err := CreateSchema(ctx, appState, testDB)
+	err := ensurePostgresSetup(ctx, appState, testDB)
 	assert.NoError(t, err)
 
 	collection := NewTestCollectionDAO(10)
@@ -141,7 +143,7 @@ func TestCollectionGetAll(t *testing.T) {
 	ctx := context.Background()
 
 	CleanDB(t, testDB)
-	err := CreateSchema(ctx, appState, testDB)
+	err := ensurePostgresSetup(ctx, appState, testDB)
 	assert.NoError(t, err)
 
 	var collectionsToCreate []DocumentCollectionDAO
@@ -177,7 +179,7 @@ func TestDeleteCollection(t *testing.T) {
 	ctx := context.Background()
 
 	CleanDB(t, testDB)
-	err := CreateSchema(ctx, appState, testDB)
+	err := ensurePostgresSetup(ctx, appState, testDB)
 	assert.NoError(t, err)
 
 	collection := NewTestCollectionDAO(10)
@@ -246,7 +248,7 @@ func TestDocumentCollectionCreateDocuments(t *testing.T) {
 	ctx := context.Background()
 
 	CleanDB(t, testDB)
-	err := CreateSchema(ctx, appState, testDB)
+	err := ensurePostgresSetup(ctx, appState, testDB)
 	assert.NoError(t, err)
 
 	collection := NewTestCollectionDAO(3)
@@ -317,7 +319,7 @@ func TestDocumentCollectionCreateDocuments(t *testing.T) {
 func TestDocumentCollectionUpdateDocuments(t *testing.T) {
 	ctx := context.Background()
 	CleanDB(t, testDB)
-	err := CreateSchema(ctx, appState, testDB)
+	err := ensurePostgresSetup(ctx, appState, testDB)
 	assert.NoError(t, err)
 
 	collection := NewTestCollectionDAO(5)
@@ -384,7 +386,7 @@ func TestDocumentCollectionUpdateDocuments(t *testing.T) {
 			t,
 			updatedDoc.Embedding,
 			returnedDoc.Embedding,
-			"Metadata mismatch for TextData %s",
+			"Metadata mismatch for MessageEmbedding %s",
 			i,
 		)
 	}
@@ -402,7 +404,7 @@ func TestDocumentCollectionGetDocuments(t *testing.T) {
 	ctx := context.Background()
 
 	CleanDB(t, testDB)
-	err := CreateSchema(ctx, appState, testDB)
+	err := ensurePostgresSetup(ctx, appState, testDB)
 	assert.NoError(t, err)
 
 	collection := NewTestCollectionDAO(10)
@@ -509,7 +511,7 @@ func TestDocumentCollectionDeleteDocumentByUUID(t *testing.T) {
 	ctx := context.Background()
 
 	CleanDB(t, testDB)
-	err := CreateSchema(ctx, appState, testDB)
+	err := ensurePostgresSetup(ctx, appState, testDB)
 	assert.NoError(t, err)
 
 	collection := NewTestCollectionDAO(10)
@@ -582,4 +584,117 @@ func getDocumentUUIDList(documents []models.Document) ([]uuid.UUID, error) {
 		uuids[i] = doc.UUID
 	}
 	return uuids, nil
+}
+
+func TestDocumentEmbeddingTasker(t *testing.T) {
+	// Create channels
+	docEmbeddingUpdateTaskCh := make(chan []models.DocEmbeddingUpdate, 1)
+	docEmbeddingTaskCh := make(chan []models.DocEmbeddingTask, 1)
+
+	// Create DocumentStore
+	documentStore, err := NewDocumentStore(
+		appState,
+		testDB,
+		docEmbeddingUpdateTaskCh,
+		docEmbeddingTaskCh,
+	)
+	assert.NoError(t, err)
+
+	// Create a DocEmbeddingUpdate and send it to the channel
+	documentToEmbed := models.Document{
+		DocumentBase: models.DocumentBase{
+			UUID:    uuid.New(),
+			Content: testutils.GenerateRandomString(10),
+		},
+		Embedding: []float32{0.1, 0.2, 0.3},
+	}
+
+	collectionName := testutils.GenerateRandomString(10)
+	documentStore.documentEmbeddingTasker(
+		collectionName,
+		[]models.Document{documentToEmbed},
+	)
+
+	select {
+	case docEmbeddingTask := <-docEmbeddingTaskCh:
+		assert.Equal(t, 1, len(docEmbeddingTask))
+		assert.Equal(t, documentToEmbed.UUID, docEmbeddingTask[0].UUID)
+		assert.Equal(t, documentToEmbed.Content, docEmbeddingTask[0].Content)
+		assert.Equal(t, collectionName, docEmbeddingTask[0].CollectionName)
+		break
+	case <-time.After(10 * time.Second):
+		assert.Fail(t, "timed out waiting for document embedding update task")
+	}
+
+	err = documentStore.Shutdown(testCtx)
+	assert.NoError(t, err)
+}
+
+func TestDocumentEmbeddingUpdater(t *testing.T) {
+	ctx, done := context.WithCancel(testCtx)
+	// create document collection
+	collection := NewTestCollectionDAO(384)
+	collection.Name = testutils.GenerateRandomString(10)
+	collection.IsAutoEmbedded = true
+	err := collection.Create(ctx)
+	assert.NoError(t, err)
+
+	// create document
+	document := models.Document{
+		DocumentBase: models.DocumentBase{
+			Content: testutils.GenerateRandomString(384),
+		},
+	}
+	uuids, err := collection.CreateDocuments(ctx, []models.Document{document})
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(uuids))
+
+	// Create channels
+	docEmbeddingUpdateTaskCh := make(chan []models.DocEmbeddingUpdate, 5)
+	docEmbeddingTaskCh := make(chan []models.DocEmbeddingTask, 5)
+
+	embedddingProcessor := extractors.NewDocEmbeddingProcessor(
+		appState,
+		docEmbeddingTaskCh,
+		docEmbeddingUpdateTaskCh,
+	)
+
+	err = embedddingProcessor.Run(ctx)
+	assert.NoError(t, err)
+
+	// Create DocumentStore
+	documentStore, err := NewDocumentStore(
+		appState,
+		testDB,
+		docEmbeddingUpdateTaskCh,
+		docEmbeddingTaskCh,
+	)
+	assert.NoError(t, err)
+
+	// Create a DocEmbeddingUpdate and send it to the channel
+	documentToEmbed := models.Document{
+		DocumentBase: models.DocumentBase{
+			UUID:    uuids[0],
+			Content: document.Content,
+		},
+	}
+
+	documentStore.documentEmbeddingTasker(
+		collection.Name,
+		[]models.Document{documentToEmbed},
+	)
+
+	// this is ugly. TODO: use a done channel
+	time.Sleep(1 * time.Second)
+
+	documents, err := collection.GetDocuments(ctx, 0, uuids, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(documents))
+	assert.Equal(t, 384, len(documents[0].Embedding))
+	assert.Equal(t, true, documents[0].IsEmbedded)
+
+	err = documentStore.Shutdown(ctx)
+	assert.NoError(t, err)
+
+	done()
 }

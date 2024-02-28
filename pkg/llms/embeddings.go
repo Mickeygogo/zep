@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/getzep/zep/config"
-
 	"github.com/getzep/zep/pkg/models"
 )
 
@@ -34,21 +32,21 @@ func GetEmbeddingModel(
 	appState *models.AppState,
 	documentType string,
 ) (*models.EmbeddingModel, error) {
-	var cfg config.EmbeddingsConfig
-
 	switch documentType {
 	case "message":
-		cfg = appState.Config.Extractors.Messages.Embeddings
-	case "summary":
-		cfg = appState.Config.Extractors.Messages.Summarizer.Embeddings
+		config := appState.Config.Extractors.Messages.Embeddings
+		return &models.EmbeddingModel{
+			Service:    config.Service,
+			Dimensions: config.Dimensions,
+		}, nil
 	case "document":
-		cfg = appState.Config.Extractors.Documents.Embeddings
+		config := appState.Config.Extractors.Documents.Embeddings
+		return &models.EmbeddingModel{
+			Service:    config.Service,
+			Dimensions: config.Dimensions,
+		}, nil
 	default:
 		return nil, errors.New("invalid document type")
-	}
 
-	return &models.EmbeddingModel{
-		Service:    cfg.Service,
-		Dimensions: cfg.Dimensions,
-	}, nil
+	}
 }

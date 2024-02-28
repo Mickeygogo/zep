@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -14,124 +15,66 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestMemorySearch(t *testing.T) {
+func TestVectorSearch(t *testing.T) {
 	// Test data
 	sessionID, err := testutils.GenerateRandomSessionID(16)
 	assert.NoError(t, err, "GenerateRandomSessionID should not return an error")
 
 	// Call putMessages function
-	err = appState.MemoryStore.PutMemory(testCtx, sessionID,
-		&models.Memory{
-			Messages: testutils.TestMessages,
-		}, false,
+	msgs, err := putMessages(testCtx, testDB, sessionID, testutils.TestMessages)
+	assert.NoError(t, err, "putMessages should not return an error")
+
+	appState.MemoryStore.NotifyExtractors(
+		context.Background(),
+		appState,
+		&models.MessageEvent{SessionID: sessionID,
+			Messages: msgs},
 	)
-	assert.NoError(t, err, "PutMemory should not return an error")
 
-	messageDAO, err := NewMessageDAO(testDB, appState, sessionID)
-	assert.NoError(t, err, "NewMessageDAO should not return an error")
-	summaryDAO, err := NewSummaryDAO(testDB, appState, sessionID)
-	assert.NoError(t, err, "NewSummaryDAO should not return an error")
+	// enrichment runs async. Wait for it to finish
+	// This is hacky but I'd prefer not to add a WaitGroup to the putMessages function just for testing purposes
+	time.Sleep(time.Second * 2)
 
-	timeout := time.After(10 * time.Second)
-	tick := time.Tick(500 * time.Millisecond)
-	for {
-		select {
-		case <-timeout:
-			t.Fatal("timed out waiting for messages to be indexed")
-		case <-tick:
-			me, err := messageDAO.GetEmbeddingListBySession(testCtx)
-			assert.NoError(t, err, "GetEmbeddingListBySession should not return an error")
-			se, err := summaryDAO.GetEmbeddings(testCtx)
-			assert.NoError(t, err, "GetEmbeddings should not return an error")
-			if len(me) != 0 && len(se) != 0 {
-				goto DONE
-			}
-		}
-	}
-
-DONE:
 	// Test cases
 	testCases := []struct {
 		name              string
 		query             string
 		limit             int
 		expectedErrorText string
-		SearchScope       models.SearchScope
-		searchType        models.SearchType
 	}{
-		{"Empty Query", "", 0, "empty query",
-			models.SearchScopeMessages, models.SearchTypeSimilarity},
-		{
-			"Non-empty Query",
-			"travel",
-			0,
-			"",
-			models.SearchScopeMessages,
-			models.SearchTypeSimilarity,
-		},
-		{"Limit 0", "travel", 0, "", models.SearchScopeMessages, models.SearchTypeSimilarity},
-		{"Limit 5", "travel", 5, "", models.SearchScopeMessages, models.SearchTypeSimilarity},
-		{"Limit 5 Empty SearchScope", "travel", 5, "", "", models.SearchTypeSimilarity},
-		{"MMR Query", "travel", 5, "", models.SearchScopeMessages, models.SearchTypeMMR},
-		{
-			"SearchScope Summary",
-			"travel",
-			1,
-			"",
-			models.SearchScopeSummary,
-			models.SearchTypeSimilarity,
-		},
-		{
-			"SearchScope Summary MMR",
-			"travel",
-			1,
-			"",
-			models.SearchScopeSummary,
-			models.SearchTypeMMR,
-		},
+		{"Empty Query", "", 0, "empty query"},
+		{"Non-empty Query", "travel", 0, ""},
+		{"Limit 0", "travel", 0, ""},
+		{"Limit 5", "travel", 5, ""},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			q := models.MemorySearchPayload{
-				Text:        tc.query,
-				SearchType:  tc.searchType,
-				SearchScope: tc.SearchScope,
-			}
+			q := models.MemorySearchPayload{Text: tc.query}
 			expectedLastN := tc.limit
 			if expectedLastN == 0 {
 				expectedLastN = 10 // Default value
 			}
 
-			s, err := searchMemory(testCtx, appState, testDB, sessionID, &q, expectedLastN)
+			s, err := searchMessages(testCtx, appState, testDB, sessionID, &q, expectedLastN)
 
 			if tc.expectedErrorText != "" {
 				assert.ErrorContains(
 					t,
 					err,
 					tc.expectedErrorText,
-					"searchMemory should return the expected error",
+					"searchMessages should return the expected error",
 				)
 			} else {
-				assert.NoError(t, err, "searchMemory should not return an error")
+				assert.NoError(t, err, "searchMessages should not return an error")
 				assert.Len(t, s, expectedLastN, fmt.Sprintf("Expected %d messages to be returned", expectedLastN))
 
-				if tc.SearchScope == models.SearchScopeSummary {
-					for _, res := range s {
-						assert.NotNil(t, res.Summary, "summary should be present")
-						assert.NotNil(t, res.Summary.UUID, "summary__uuid should be present")
-						assert.NotNil(t, res.Summary.CreatedAt, "summary__created_at should be present")
-						assert.NotNil(t, res.Summary.Content, "summary__content should be present")
-						assert.NotNil(t, res.Dist, "dist should be present")
-					}
-				} else {
-					for _, res := range s {
-						assert.NotNil(t, res.Message.UUID, "message__uuid should be present")
-						assert.NotNil(t, res.Message.CreatedAt, "message__created_at should be present")
-						assert.NotNil(t, res.Message.Role, "message__role should be present")
-						assert.NotNil(t, res.Message.Content, "message__content should be present")
-						assert.NotNil(t, res.Dist, "dist should be present")
-					}
+				for _, res := range s {
+					assert.NotNil(t, res.Message.UUID, "message__uuid should be present")
+					assert.NotNil(t, res.Message.CreatedAt, "message__created_at should be present")
+					assert.NotNil(t, res.Message.Role, "message__role should be present")
+					assert.NotNil(t, res.Message.Content, "message__content should be present")
+					assert.NotZero(t, res.Message.TokenCount, "message_token_count should be present")
 				}
 			}
 		})
@@ -171,7 +114,7 @@ func TestAddDateFilters(t *testing.T) {
 			err := json.Unmarshal([]byte(tt.inputDates), &inputDates)
 			assert.NoError(t, err)
 
-			addMessageDateFilters(&qb, inputDates, "m")
+			addMessageDateFilters(&qb, inputDates)
 
 			selectQuery := qb.Unwrap().(*bun.SelectQuery)
 

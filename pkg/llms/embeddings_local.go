@@ -9,13 +9,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/avast/retry-go/v4"
+
 	"github.com/getzep/zep/pkg/models"
 )
 
-const MaxLocalEmbedderRetryAttempts = 5
-const LocalEmbedderTimeout = 60 * time.Second
-
-// embedTextsLocal embeds a slice of texts using the local embeddings service
 func embedTextsLocal(
 	ctx context.Context,
 	appState *models.AppState,
@@ -26,25 +24,17 @@ func embedTextsLocal(
 		return nil, nil
 	}
 
-	var endpoint string
-	switch documentType {
-	case "message":
-		endpoint = "/embeddings/message"
-	case "summary":
-		endpoint = "/embeddings/message"
-	case "document":
-		endpoint = "/embeddings/document"
-	default:
+	if documentType != "message" && documentType != "document" {
 		return nil, fmt.Errorf("invalid document type: %s", documentType)
 	}
 
-	url := appState.Config.NLP.ServerURL + endpoint
+	url := appState.Config.NLP.ServerURL + "/embeddings/" + documentType
 
-	documents := make([]models.TextData, len(texts))
+	documents := make([]models.MessageEmbedding, len(texts))
 	for i, text := range texts {
-		documents[i] = models.TextData{Text: text}
+		documents[i] = models.MessageEmbedding{Text: text}
 	}
-	collection := models.TextEmbeddingCollection{
+	collection := models.MessageEmbeddingCollection{
 		Embeddings: documents,
 	}
 	jsonBody, err := json.Marshal(collection)
@@ -53,7 +43,20 @@ func embedTextsLocal(
 		return nil, err
 	}
 
-	bodyBytes, err := makeEmbedRequest(ctx, url, jsonBody)
+	var bodyBytes []byte
+	// Retry POST request to entity extractor 3 times with 1 second delay.
+	err = retry.Do(
+		func() error {
+			var err error
+			bodyBytes, err = makeEmbedRequest(ctx, url, jsonBody)
+			if err != nil {
+				return err
+			}
+			return nil
+		},
+		retry.Attempts(3),
+		retry.Delay(time.Second),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -72,27 +75,9 @@ func embedTextsLocal(
 	return m, nil
 }
 
-// makeEmbedRequest makes a POST request to the local embeddings service. It
-// returns the response body as a byte slice. A retryablehttp.Client is used to
-// make the request.
 func makeEmbedRequest(ctx context.Context, url string, jsonBody []byte) ([]byte, error) {
-	// we set both the context and the request timeout (below) to the same value
-	// so that the request will be cancelled if the context times out and/or the
-	// request times out
-	ctx, cancel := context.WithTimeout(ctx, LocalEmbedderTimeout)
-	defer cancel()
-
-	httpClient := NewRetryableHTTPClient(
-		MaxLocalEmbedderRetryAttempts,
-		LocalEmbedderTimeout,
-	)
-
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		url,
-		bytes.NewBuffer(jsonBody),
-	)
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, err
 	}
@@ -103,12 +88,7 @@ func makeEmbedRequest(ctx context.Context, url string, jsonBody []byte) ([]byte,
 		log.Error("Error making POST request:", err)
 		return nil, err
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			log.Error("Error closing response body:", err)
-		}
-	}(resp.Body)
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		errorString := fmt.Sprintf(

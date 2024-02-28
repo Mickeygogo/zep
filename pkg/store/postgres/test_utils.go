@@ -17,13 +17,6 @@ func CleanDB(t *testing.T, db *bun.DB) {
 	require.NoError(t, err)
 
 	_, err = db.NewDropTable().
-		Model(&UserSchema{}).
-		Cascade().
-		IfExists().
-		Exec(context.Background())
-	require.NoError(t, err)
-
-	_, err = db.NewDropTable().
 		Model(&MessageStoreSchema{}).
 		Cascade().
 		IfExists().
@@ -39,12 +32,6 @@ func CleanDB(t *testing.T, db *bun.DB) {
 		Model(&SummaryStoreSchema{}).
 		Cascade().
 		IfExists().
-		Exec(context.Background())
-	require.NoError(t, err)
-	_, err = db.NewDropTable().
-		Model(&SummaryVectorStoreSchema{}).
-		IfExists().
-		Cascade().
 		Exec(context.Background())
 	require.NoError(t, err)
 	_, err = db.NewDropTable().

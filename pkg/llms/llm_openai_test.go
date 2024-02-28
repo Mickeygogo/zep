@@ -19,21 +19,12 @@ func TestZepOpenAILLM_Init(t *testing.T) {
 		},
 	}
 
-	zllm, err := NewOpenAILLM(context.Background(), cfg)
-	assert.NoError(t, err, "Expected no error from NewOpenAILLM")
+	zllm := &ZepOpenAILLM{}
 
-	err = zllm.Init(context.Background(), cfg)
+	err := zllm.Init(context.Background(), cfg)
 	assert.NoError(t, err, "Expected no error from Init")
-
-	z, ok := zllm.(*ZepLLM)
-	assert.True(t, ok, "Expected ZepLLM")
-
-	assert.NotNil(t, z.llm, "Expected client to be initialized")
-
-	o, ok := z.llm.(*ZepOpenAILLM)
-	assert.True(t, ok, "Expected ZepOpenAILLM")
-	assert.NotNil(t, o.client, "Expected tkm to be initialized")
-	assert.NotNil(t, o.tkm, "Expected tkm to be initialized")
+	assert.NotNil(t, zllm.llm, "Expected llm to be initialized")
+	assert.NotNil(t, zllm.tkm, "Expected tkm to be initialized")
 }
 
 func TestZepOpenAILLM_TestConfigureClient(t *testing.T) {
@@ -74,35 +65,11 @@ func TestZepOpenAILLM_TestConfigureClient(t *testing.T) {
 		}
 	})
 
-	t.Run("Test with AzureOpenAIEmbeddingModelAndCustomModelName", func(t *testing.T) {
-		cfg := &config.Config{
-			LLM: config.LLM{
-				OpenAIAPIKey:        "test-key",
-				AzureOpenAIEndpoint: "https://azure.openai.com",
-				Model:               "some-model",
-				AzureOpenAIModel: config.AzureOpenAIConfig{
-					LLMDeployment:       "test-llm-deployment",
-					EmbeddingDeployment: "test-embedding-deployment",
-				},
-			},
-		}
-
-		options, err := zllm.configureClient(cfg)
-		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
-		}
-
-		if len(options) != 6 {
-			t.Errorf("Expected 6 options, got %d", len(options))
-		}
-	})
-
-	t.Run("Test with OpenAIEndpointAndCustomModelName", func(t *testing.T) {
+	t.Run("Test with OpenAIEndpoint", func(t *testing.T) {
 		cfg := &config.Config{
 			LLM: config.LLM{
 				OpenAIAPIKey:   "test-key",
 				OpenAIEndpoint: "https://openai.com",
-				Model:          "some-model",
 			},
 		}
 

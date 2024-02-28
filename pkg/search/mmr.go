@@ -1,91 +1,108 @@
 package search
 
 import (
-	"errors"
 	"fmt"
 	"math"
 
-	"github.com/getzep/zep/internal"
-	"github.com/viterin/vek"
-	"github.com/viterin/vek/vek32"
+	"gonum.org/v1/gonum/floats"
+
+	"gonum.org/v1/gonum/mat"
 )
 
-var log = internal.GetLogger()
+// CosineSimilarity calculates the cosine similarity between two vectors.
+// The vectors must be of the same length.
+func CosineSimilarity(X, Y *mat.Dense) (*mat.Dense, error) { // nolint: gocritic
+	rX, cX := X.Dims()
+	rY, cY := Y.Dims()
 
-func init() {
-	log.Infof("MMR acceleration status: %v", vek.Info())
-}
+	if rX == 0 || rY == 0 {
+		return mat.NewDense(0, 0, nil), nil
+	}
 
-// pairwiseCosineSimilarity takes two matrices of vectors and returns a matrix, where
-// the value at [i][j] is the cosine similarity between the ith vector in matrix1 and
-// the jth vector in matrix2.
-func pairwiseCosineSimilarity(matrix1 [][]float32, matrix2 [][]float32) ([][]float32, error) {
-	result := make([][]float32, len(matrix1))
-	for i, vec1 := range matrix1 {
-		result[i] = make([]float32, len(matrix2))
-		for j, vec2 := range matrix2 {
-			if len(vec1) != len(vec2) {
-				return nil, fmt.Errorf(
-					"vector lengths do not match: %d != %d",
-					len(vec1),
-					len(vec2),
-				)
+	if cX != cY {
+		return nil, fmt.Errorf(
+			"number of columns in X and Y must be the same. X has shape [%d, %d] and Y has shape [%d, %d]",
+			rX,
+			cX,
+			rY,
+			cY,
+		)
+	}
+
+	Xnorm := mat.NewVecDense(rX, nil)
+	Ynorm := mat.NewVecDense(rY, nil)
+
+	for i := 0; i < rX; i++ {
+		Xnorm.SetVec(i, mat.Norm(X.RowView(i), 2))
+	}
+
+	for i := 0; i < rY; i++ {
+		Ynorm.SetVec(i, mat.Norm(Y.RowView(i), 2))
+	}
+
+	var XT mat.Dense
+	XT.CloneFrom(X.T())
+
+	similarity := mat.NewDense(rX, rY, nil)
+	similarity.Product(X, &XT)
+
+	for i := 0; i < rX; i++ {
+		for j := 0; j < rY; j++ {
+			val := similarity.At(i, j) / (Xnorm.AtVec(i) * Ynorm.AtVec(j))
+			if math.IsNaN(val) || math.IsInf(val, 0) {
+				val = 0.0
 			}
-			result[i][j] = vek32.CosineSimilarity(vec1, vec2)
+			similarity.Set(i, j, val)
 		}
 	}
-	return result, nil
+
+	return similarity, nil
 }
 
 // MaximalMarginalRelevance implements the Maximal Marginal Relevance algorithm.
 // It takes a query embedding, a list of embeddings, a lambda multiplier, and a
 // number of results to return. It returns a list of indices of the embeddings
 // that are most relevant to the query.
+// This is a relatively naive and unoptimized implementation of MMR. :-/
 // See https://www.cs.cmu.edu/~jgc/publication/The_Use_MMR_Diversity_Based_LTMIR_1998.pdf
-// Implementation borrowed from LangChain
-// https://github.com/langchain-ai/langchain/blob/4a2f0c51a116cc3141142ea55254e270afb6acde/libs/langchain/langchain/vectorstores/utils.py
 func MaximalMarginalRelevance(
-	queryEmbedding []float32,
-	embeddingList [][]float32,
-	lambdaMult float32,
+	queryEmbedding *mat.Dense,
+	embeddingList *mat.Dense,
+	lambdaMult float64,
 	k int,
 ) ([]int, error) {
-	// if either k or the length of the embedding list is 0, return an empty list
-	if min(k, len(embeddingList)) <= 0 {
+	rEmbed, _ := embeddingList.Dims()
+	if k <= 0 || rEmbed == 0 {
 		return []int{}, nil
 	}
 
-	// We expect the query embedding and the embeddings in the list to have the same width
-	if len(queryEmbedding) != len(embeddingList[0]) {
-		return []int{}, errors.New("query embedding width does not match embedding vector width")
-	}
+	var mostSimilar int
+	var bestScore float64
+	var idxToAdd int
 
-	similarityToQueryMatrix, err := pairwiseCosineSimilarity(
-		[][]float32{queryEmbedding},
-		embeddingList,
-	)
+	similarityToQuery, err := CosineSimilarity(queryEmbedding, embeddingList)
 	if err != nil {
 		return nil, err
 	}
-	similarityToQuery := similarityToQueryMatrix[0]
-
-	mostSimilar := vek32.ArgMax(similarityToQuery)
+	mostSimilar = floats.MaxIdx(similarityToQuery.RawMatrix().Data)
 	idxs := []int{mostSimilar}
-	selected := [][]float32{embeddingList[mostSimilar]}
+	selected := mat.DenseCopyOf(embeddingList.RowView(mostSimilar))
 
-	for len(idxs) < min(k, len(embeddingList)) {
-		var bestScore float32 = -math.MaxFloat32
-		idxToAdd := -1
-		similarityToSelected, err := pairwiseCosineSimilarity(embeddingList, selected)
+	for len(idxs) < min(k, rEmbed) {
+		bestScore = math.Inf(-1)
+		idxToAdd = -1
+		r, c := selected.Dims()
+		selectedTransposed := mat.NewDense(c, r, nil)
+		selectedTransposed.CloneFrom(selected.T())
+		similarityToSelected, err := CosineSimilarity(embeddingList, selectedTransposed)
 		if err != nil {
 			return nil, err
 		}
-
-		for i, queryScore := range similarityToQuery {
+		for i, queryScore := range similarityToQuery.RawMatrix().Data {
 			if contains(idxs, i) {
 				continue
 			}
-			redundantScore := vek32.Max(similarityToSelected[i])
+			redundantScore := floats.Max(similarityToSelected.RawMatrix().Data)
 			equationScore := lambdaMult*queryScore - (1-lambdaMult)*redundantScore
 			if equationScore > bestScore {
 				bestScore = equationScore
@@ -93,12 +110,11 @@ func MaximalMarginalRelevance(
 			}
 		}
 		idxs = append(idxs, idxToAdd)
-		selected = append(selected, embeddingList[idxToAdd])
+		selected.Stack(selected, embeddingList.RowView(idxToAdd))
 	}
 	return idxs, nil
 }
 
-// contains returns true if the slice contains the value
 func contains(slice []int, val int) bool {
 	for _, item := range slice {
 		if item == val {
@@ -106,4 +122,11 @@ func contains(slice []int, val int) bool {
 		}
 	}
 	return false
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

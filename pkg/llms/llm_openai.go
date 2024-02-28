@@ -14,19 +14,13 @@ import (
 	"github.com/tmc/langchaingo/llms/openai"
 )
 
-const OpenAICallTimeout = 60 * time.Second
-const OpenAIAPITimeout = 20 * time.Second
+const OpenAIAPITimeout = 90 * time.Second
 const OpenAIAPIKeyNotSetError = "ZEP_OPENAI_API_KEY is not set" //nolint:gosec
-const MaxOpenAIAPIRequestAttempts = 5
 
 var _ models.ZepLLM = &ZepOpenAILLM{}
 
-func NewOpenAILLM(ctx context.Context, cfg *config.Config) (models.ZepLLM, error) {
-	zllm := &ZepLLM{
-		llm: &ZepOpenAILLM{
-			cfg: cfg,
-		},
-	}
+func NewOpenAILLM(ctx context.Context, cfg *config.Config) (*ZepOpenAILLM, error) {
+	zllm := &ZepOpenAILLM{}
 	err := zllm.Init(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -35,9 +29,8 @@ func NewOpenAILLM(ctx context.Context, cfg *config.Config) (models.ZepLLM, error
 }
 
 type ZepOpenAILLM struct {
-	client *openai.Chat
-	cfg    *config.Config
-	tkm    *tiktoken.Tiktoken
+	llm *openai.Chat
+	tkm *tiktoken.Tiktoken
 }
 
 func (zllm *ZepOpenAILLM) Init(_ context.Context, cfg *config.Config) error {
@@ -59,7 +52,7 @@ func (zllm *ZepOpenAILLM) Init(_ context.Context, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	zllm.client = llm
+	zllm.llm = llm
 
 	return nil
 }
@@ -69,7 +62,7 @@ func (zllm *ZepOpenAILLM) Call(ctx context.Context,
 	options ...llms.CallOption,
 ) (string, error) {
 	// If the LLM is not initialized, return an error
-	if zllm.client == nil {
+	if zllm.llm == nil {
 		return "", NewLLMError(InvalidLLMModelError, nil)
 	}
 
@@ -77,12 +70,12 @@ func (zllm *ZepOpenAILLM) Call(ctx context.Context,
 		options = append(options, llms.WithTemperature(DefaultTemperature))
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, OpenAICallTimeout)
+	thisCtx, cancel := context.WithTimeout(ctx, OpenAIAPITimeout)
 	defer cancel()
 
 	messages := []schema.ChatMessage{schema.SystemChatMessage{Content: prompt}}
 
-	completion, err := zllm.client.Call(ctx, messages, options...)
+	completion, err := zllm.llm.Call(thisCtx, messages, options...)
 	if err != nil {
 		return "", err
 	}
@@ -92,19 +85,22 @@ func (zllm *ZepOpenAILLM) Call(ctx context.Context,
 
 func (zllm *ZepOpenAILLM) EmbedTexts(ctx context.Context, texts []string) ([][]float32, error) {
 	// If the LLM is not initialized, return an error
-	if zllm.client == nil {
+	if zllm.llm == nil {
 		return nil, NewLLMError(InvalidLLMModelError, nil)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, OpenAICallTimeout)
+	thisCtx, cancel := context.WithTimeout(ctx, OpenAIAPITimeout)
 	defer cancel()
 
-	embeddings, err := zllm.client.CreateEmbedding(ctx, texts)
+	embeddings, err := zllm.llm.CreateEmbedding(thisCtx, texts)
 	if err != nil {
 		return nil, NewLLMError("error while creating embedding", err)
 	}
 
-	return embeddings, nil
+	// downcast the embeddings to [][]float32
+	m := Float64ToFloat32Matrix(embeddings)
+
+	return m, nil
 }
 
 // GetTokenCount returns the number of tokens in the text
@@ -123,13 +119,12 @@ func (zllm *ZepOpenAILLM) configureClient(cfg *config.Config) ([]openai.Option, 
 		log.Fatal("only one of AzureOpenAIEndpoint or OpenAIEndpoint can be set")
 	}
 
-	// Set up the HTTP client and config OpenTelemetry wrapper
-	httpClient := NewRetryableHTTPClient(MaxOpenAIAPIRequestAttempts, OpenAIAPITimeout)
+	retryableHTTPClient := NewRetryableHTTPClient()
 
 	options := make([]openai.Option, 0)
 	options = append(
 		options,
-		openai.WithHTTPClient(httpClient),
+		openai.WithHTTPClient(retryableHTTPClient.StandardClient()),
 		openai.WithModel(cfg.LLM.Model),
 		openai.WithToken(apiKey),
 	)
@@ -137,20 +132,14 @@ func (zllm *ZepOpenAILLM) configureClient(cfg *config.Config) ([]openai.Option, 
 	switch {
 	case cfg.LLM.AzureOpenAIEndpoint != "":
 		// Check configuration for AzureOpenAIEndpoint; if it's set, use the DefaultAzureConfig
-		// and provided endpoint Path
+		// and provided endpoint URL
 		options = append(
 			options,
 			openai.WithAPIType(openai.APITypeAzure),
 			openai.WithBaseURL(cfg.LLM.AzureOpenAIEndpoint),
 		)
-		if cfg.LLM.AzureOpenAIModel.EmbeddingDeployment != "" {
-			options = append(
-				options,
-				openai.WithEmbeddingModel(cfg.LLM.AzureOpenAIModel.EmbeddingDeployment),
-			)
-		}
 	case cfg.LLM.OpenAIEndpoint != "":
-		// If an alternate OpenAI-compatible endpoint Path is set, use this as the base Path for requests
+		// If an alternate OpenAI-compatible endpoint URL is set, use this as the base URL for requests
 		options = append(
 			options,
 			openai.WithBaseURL(cfg.LLM.OpenAIEndpoint),

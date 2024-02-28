@@ -11,7 +11,6 @@ import (
 	"github.com/getzep/zep/pkg/models"
 	"github.com/google/uuid"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/driver/pgdriver"
 )
 
 func NewDocumentCollectionDAO(
@@ -33,13 +32,11 @@ type DocumentCollectionDAO struct {
 func (dc *DocumentCollectionDAO) Create(
 	ctx context.Context,
 ) error {
-	// Ensure that the collection name is lowercase.
-	dc.Name = dc.getName()
-
 	// TODO: validate collection struct fields using validator
-	if dc.getName() == "" {
+	if dc.Name == "" {
 		return errors.New("collection name is required")
 	}
+	dc.Name = strings.ToLower(dc.Name)
 
 	if dc.TableName == "" {
 		tableName, err := generateDocumentTableName(dc)
@@ -47,15 +44,6 @@ func (dc *DocumentCollectionDAO) Create(
 			return fmt.Errorf("failed to generate collection table name: %w", err)
 		}
 		dc.TableName = tableName
-	}
-
-	// Determine the index type to use. Default to HNSW if available, otherwise
-	// use IVFFLAT.
-	dc.IndexType = "ivfflat"
-	if dc.appState.Config.Store.Postgres.AvailableIndexes.HSNW {
-		dc.IndexType = "hnsw"
-		// We'll create the index when we create the document table.
-		dc.IsIndexed = true
 	}
 
 	// We only support cosine distance function for now.
@@ -68,15 +56,15 @@ func (dc *DocumentCollectionDAO) Create(
 		Returning("*").
 		Exec(ctx)
 	if err != nil {
-		if err, ok := err.(pgdriver.Error); ok && err.IntegrityViolation() {
-			return models.NewBadRequestError("collection already exists: " + dc.getName())
+		if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
+			return fmt.Errorf("collection with name %s already exists", dc.Name)
 		}
 		return fmt.Errorf("failed to insert collection: %w", err)
 	}
 
 	// Create the document table for the collection. It will only be created if
 	// it doesn't already exist.
-	err = createDocumentTable(ctx, dc.appState, dc.db, dc.TableName, dc.EmbeddingDimensions)
+	err = createDocumentTable(ctx, dc.db, dc.TableName, dc.EmbeddingDimensions)
 	if err != nil {
 		return fmt.Errorf("failed to create document table: %w", err)
 	}
@@ -88,15 +76,16 @@ func (dc *DocumentCollectionDAO) Create(
 func (dc *DocumentCollectionDAO) Update(
 	ctx context.Context,
 ) error {
-	if dc.getName() == "" {
+	if dc.Name == "" {
 		return errors.New("collection Name is required")
 	}
+	dc.Name = strings.ToLower(dc.Name)
 
 	collectionRecord := DocumentCollectionSchema{DocumentCollection: dc.DocumentCollection}
 
 	r, err := dc.db.NewUpdate().
 		Model(&collectionRecord).
-		Where("name = ?", dc.getName()).
+		Where("name = ?", dc.Name).
 		OmitZero().
 		Returning("*").
 		Exec(ctx)
@@ -110,7 +99,7 @@ func (dc *DocumentCollectionDAO) Update(
 		return fmt.Errorf("failed to check rows affected: %w", err)
 	}
 	if rowsUpdated == 0 {
-		return models.NewNotFoundError("collection: " + dc.getName())
+		return models.NewNotFoundError("collection: " + dc.Name)
 	}
 	return nil
 }
@@ -119,30 +108,31 @@ func (dc *DocumentCollectionDAO) Update(
 func (dc *DocumentCollectionDAO) GetByName(
 	ctx context.Context,
 ) error {
-	if dc.getName() == "" {
+	if dc.Name == "" {
 		return errors.New("collection name is required")
 	}
+	dc.Name = strings.ToLower(dc.Name)
 
 	collectionRecord := DocumentCollectionSchema{DocumentCollection: dc.DocumentCollection}
 
 	err := dc.db.NewSelect().
 		Model(&collectionRecord).
-		Where("name = ?", dc.getName()).
+		Where("name = ?", dc.Name).
 		Scan(ctx)
 	if err != nil {
 		if strings.Contains(err.Error(), "no rows in result set") {
-			return models.NewNotFoundError("collection: " + dc.getName())
+			return models.NewNotFoundError("collection: " + dc.Name)
 		}
 		return fmt.Errorf("failed to get collection: %w", err)
 	}
 
 	if collectionRecord.UUID == uuid.Nil {
-		return models.NewNotFoundError("collection: " + dc.getName())
+		return models.NewNotFoundError("collection: " + dc.Name)
 	}
 
 	dc.DocumentCollection = collectionRecord.DocumentCollection
 
-	counts, err := dc.GetCollectionCounts(ctx)
+	counts, err := dc.getCollectionCounts(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get collection counts: %w", err)
 	}
@@ -162,24 +152,15 @@ func (dc *DocumentCollectionDAO) GetAll(
 		return nil, fmt.Errorf("failed to get collection list: %w", err)
 	}
 
-	for i := range collections {
-		c := NewDocumentCollectionDAO(dc.appState, dc.db, collections[i])
-		err = c.GetByName(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get collection: %w", err)
-		}
-		counts, err := c.GetCollectionCounts(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get collection counts: %w", err)
-		}
-		collections[i].DocumentCollectionCounts = &counts
+	if len(collections) == 0 {
+		return nil, models.NewNotFoundError("collections")
 	}
 
 	return collections, nil
 }
 
-// GetCollectionCounts returns the number of documents and embedded documents
-func (dc *DocumentCollectionDAO) GetCollectionCounts(
+// getCollectionCounts returns the number of documents and embedded documents
+func (dc *DocumentCollectionDAO) getCollectionCounts(
 	ctx context.Context,
 ) (models.DocumentCollectionCounts, error) {
 	if dc.TableName == "" {
@@ -206,7 +187,7 @@ func (dc *DocumentCollectionDAO) GetCollectionCounts(
 // Delete deletes a collection from the collections table and drops the
 // collection's document table.
 func (dc *DocumentCollectionDAO) Delete(ctx context.Context) error {
-	if dc.getName() == "" {
+	if dc.Name == "" {
 		return errors.New("collection name is required")
 	}
 	// start a transaction
@@ -224,7 +205,7 @@ func (dc *DocumentCollectionDAO) Delete(ctx context.Context) error {
 	}
 
 	// Delete the collection row.
-	err = deleteCollectionRow(ctx, tx, dc.getName())
+	err = deleteCollectionRow(ctx, tx, dc.Name)
 	if err != nil {
 		return err
 	}
@@ -251,7 +232,7 @@ func (dc *DocumentCollectionDAO) CreateDocuments(
 	if len(documents) == 0 {
 		return nil, nil
 	}
-	if dc.getName() == "" {
+	if dc.Name == "" {
 		return nil, errors.New("collection name cannot be empty")
 	}
 	if err := dc.GetByName(ctx); err != nil {
@@ -271,9 +252,6 @@ func (dc *DocumentCollectionDAO) CreateDocuments(
 		Returning("uuid").
 		Exec(ctx)
 	if err != nil {
-		if err, ok := err.(pgdriver.Error); ok && err.IntegrityViolation() {
-			return nil, models.NewBadRequestError("document_id already exists")
-		}
 		if strings.Contains(err.Error(), "different vector dimensions") {
 			return nil, store.NewEmbeddingMismatchError(err)
 		}
@@ -379,7 +357,7 @@ func (dc *DocumentCollectionDAO) GetDocuments(
 	uuids []uuid.UUID,
 	documentIDs []string,
 ) ([]models.Document, error) {
-	if dc.getName() == "" {
+	if dc.Name == "" {
 		return nil, errors.New("collection name cannot be empty")
 	}
 
@@ -428,7 +406,7 @@ func (dc *DocumentCollectionDAO) DeleteDocumentsByUUID(
 	ctx context.Context,
 	documentUUIDs []uuid.UUID,
 ) error {
-	if dc.getName() == "" {
+	if dc.Name == "" {
 		return errors.New("collection name cannot be empty")
 	}
 	if err := dc.GetByName(ctx); err != nil {
@@ -463,13 +441,14 @@ func (dc *DocumentCollectionDAO) DeleteDocumentsByUUID(
 func (dc *DocumentCollectionDAO) SearchDocuments(ctx context.Context,
 	query *models.DocumentSearchPayload,
 	limit int,
+	withMMR bool,
 	pageNumber int,
 	pageSize int) (*models.DocumentSearchResultPage, error) {
 	// TODO: implement pagination
 	_ = pageNumber
 	_ = pageSize
 
-	if dc.getName() == "" {
+	if dc.Name == "" {
 		return nil, errors.New("collection name cannot be empty")
 	}
 
@@ -492,6 +471,7 @@ func (dc *DocumentCollectionDAO) SearchDocuments(ctx context.Context,
 		query,
 		&dc.DocumentCollection,
 		limit,
+		withMMR,
 	)
 
 	results, err := search.Execute()
@@ -500,10 +480,6 @@ func (dc *DocumentCollectionDAO) SearchDocuments(ctx context.Context,
 	}
 
 	return results, nil
-}
-
-func (dc *DocumentCollectionDAO) getName() string {
-	return strings.ToLower(dc.Name)
 }
 
 func deleteCollectionRow(

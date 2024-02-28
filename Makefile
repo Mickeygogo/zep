@@ -60,20 +60,6 @@ swagger:
 lint:
 	golangci-lint run --deadline=90s --sort-results -c golangci.yaml
 
-## Run the dev stack docker compose setup. This exposes DB and NLP services
-## for local development. This does not start the Zep service.
-dev:
-	docker compose -f docker-compose.dev.yaml up db nlp
-
-## Go Watch for web development
-## https://github.com/mitranim/gow
-watch:
-	ZEP_DEVELOPMENT=true ZEP_SERVER_HOST=localhost gow -e=go,mod,html,js,css -i=node_modules run .
-
-# Build web assets
-web:
-	cd pkg/web && npx tailwindcss -i static/input.css -o static/output.css
-
 ## Docker:
 docker-build: ## Use the dockerfile to build the container
 	DOCKER_BUILDKIT=1 docker build --rm --tag $(BINARY_NAME) .

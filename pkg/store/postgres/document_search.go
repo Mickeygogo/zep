@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/getzep/zep/pkg/llms"
-	"github.com/getzep/zep/pkg/search"
 	"github.com/getzep/zep/pkg/store"
 	"github.com/pgvector/pgvector-go"
 	"github.com/uptrace/bun"
@@ -16,7 +15,6 @@ import (
 	"github.com/getzep/zep/pkg/models"
 )
 
-const DefaultEFSearch = 100
 const DefaultDocumentSearchLimit = 20
 const MaxParallelWorkersPerGather = 4
 
@@ -27,6 +25,7 @@ func newDocumentSearchOperation(
 	searchPayload *models.DocumentSearchPayload,
 	collection *models.DocumentCollection,
 	limit int,
+	withMMR bool,
 ) *documentSearchOperation {
 	if limit <= 0 {
 		limit = DefaultDocumentSearchLimit
@@ -39,6 +38,7 @@ func newDocumentSearchOperation(
 		searchPayload: searchPayload,
 		collection:    collection,
 		limit:         limit,
+		withMMR:       withMMR,
 	}
 }
 
@@ -50,36 +50,25 @@ type documentSearchOperation struct {
 	collection    *models.DocumentCollection
 	queryVector   []float32
 	limit         int
+	withMMR       bool
 }
 
 func (dso *documentSearchOperation) Execute() (*models.DocumentSearchResultPage, error) {
-	var results []models.SearchDocumentResult
+	var results []models.SearchDocumentQuery
 
 	var count int
 	var err error
 
 	// run in transaction to set LOCAL
 	err = dso.db.RunInTx(dso.ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-		switch dso.collection.IndexType {
-		case "ivfflat":
-			if dso.collection.IsIndexed {
-				_, err = tx.Exec("SET LOCAL ivfflat.probes = ?", dso.collection.ProbeCount)
-			} else {
-				_, err = tx.Exec("SET LOCAL max_parallel_workers_per_gather = ?", MaxParallelWorkersPerGather)
-			}
-			if err != nil {
-				return fmt.Errorf("error setting probes: %w", err)
-			}
-		case "hnsw":
-			if dso.collection.IsIndexed {
-				_, err = tx.Exec("SET LOCAL hnsw.ef_search = ?", DefaultEFSearch)
-			} else {
-				_, err = tx.Exec("SET LOCAL max_parallel_workers_per_gather = ?", MaxParallelWorkersPerGather)
-			}
-		default:
-			return fmt.Errorf("unknown index type %s", dso.collection.IndexType)
+		if dso.collection.IsIndexed {
+			_, err = tx.Exec("SET LOCAL ivfflat.probes = ?", dso.collection.ProbeCount)
+		} else {
+			_, err = tx.Exec("SET LOCAL max_parallel_workers_per_gather = ?", MaxParallelWorkersPerGather)
 		}
-
+		if err != nil {
+			return fmt.Errorf("error setting probes: %w", err)
+		}
 		count, err = dso.execQuery(tx, &results)
 		if err != nil {
 			return fmt.Errorf("error executing query: %w", err)
@@ -91,13 +80,6 @@ func (dso *documentSearchOperation) Execute() (*models.DocumentSearchResultPage,
 		return nil, fmt.Errorf("error executing search: %w", err)
 	}
 
-	if dso.searchPayload.SearchType == models.SearchTypeMMR {
-		results, err = dso.reRankMMR(results)
-		if err != nil {
-			return nil, fmt.Errorf("error reranking results: %w", err)
-		}
-	}
-
 	resultPage := &models.DocumentSearchResultPage{
 		Results:     searchResultsFromSearchQueries(results),
 		QueryVector: dso.queryVector,
@@ -107,42 +89,10 @@ func (dso *documentSearchOperation) Execute() (*models.DocumentSearchResultPage,
 	return resultPage, nil
 }
 
-// reRankMMR reranks the results using the MMR algorithm.
-func (dso *documentSearchOperation) reRankMMR(
-	results []models.SearchDocumentResult,
-) ([]models.SearchDocumentResult, error) {
-	lambda := dso.searchPayload.MMRLambda
-	if lambda == 0 {
-		lambda = DefaultMMRLambda
-	}
-
-	k := dso.limit
-	if k == 0 {
-		k = DefaultDocumentSearchLimit
-	}
-
-	resultVectors := make([][]float32, len(results))
-	for i := range results {
-		resultVectors[i] = results[i].Embedding
-	}
-
-	rankedIndices, err := search.MaximalMarginalRelevance(dso.queryVector, resultVectors, lambda, k)
-	if err != nil {
-		return nil, fmt.Errorf("error reranking results: %w", err)
-	}
-
-	rankedResults := make([]models.SearchDocumentResult, len(rankedIndices))
-	for i := range rankedIndices {
-		rankedResults[i] = results[rankedIndices[i]]
-	}
-
-	return rankedResults, nil
-}
-
 // execQuery executes the query and scans the results into the provided results slice. It accepts a bun DB or Tx.
 func (dso *documentSearchOperation) execQuery(
 	db bun.IDB,
-	results *[]models.SearchDocumentResult,
+	results *[]models.SearchDocumentQuery,
 ) (int, error) {
 	query, err := dso.buildQuery(db)
 	if err != nil {
@@ -159,11 +109,15 @@ func (dso *documentSearchOperation) execQuery(
 
 	count := len(*results)
 
+	if count == 0 {
+		return 0, models.NewNotFoundError("no results found")
+	}
+
 	return count, nil
 }
 
 func (dso *documentSearchOperation) buildQuery(db bun.IDB) (*bun.SelectQuery, error) {
-	m := &[]models.SearchDocumentResult{}
+	m := &[]models.SearchDocumentQuery{}
 	query := db.NewSelect().Model(m).
 		ModelTableExpr("?", bun.Ident(dso.collection.TableName)).
 		Column("*").
@@ -200,11 +154,8 @@ func (dso *documentSearchOperation) buildQuery(db bun.IDB) (*bun.SelectQuery, er
 	// If we're using MMR, we need to add a limit of 2x the requested limit to allow for the MMR
 	// algorithm to rerank and filter out results.
 	limit := dso.limit
-	if dso.searchPayload.SearchType == models.SearchTypeMMR {
-		limit *= DefaultMMRMultiplier
-		if limit < 10 {
-			limit = 10
-		}
+	if dso.withMMR {
+		limit *= 2
 	}
 	query = query.Limit(limit)
 
@@ -253,7 +204,7 @@ func (dso *documentSearchOperation) applyDocsMetadataFilter(
 		if err != nil {
 			return nil, fmt.Errorf("error unmarshalling metadata %w", err)
 		}
-		qb = parseJSONQuery(qb, &jq, false, "")
+		qb = parseDocumentJSONQuery(qb, &jq, false)
 	}
 
 	query = qb.Unwrap().(*bun.SelectQuery)
@@ -261,7 +212,7 @@ func (dso *documentSearchOperation) applyDocsMetadataFilter(
 	return query, nil
 }
 
-func searchResultsFromSearchQueries(s []models.SearchDocumentResult) []models.DocumentSearchResult {
+func searchResultsFromSearchQueries(s []models.SearchDocumentQuery) []models.DocumentSearchResult {
 	result := make([]models.DocumentSearchResult, len(s))
 
 	for i := range s {

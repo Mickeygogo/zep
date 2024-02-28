@@ -1,37 +1,26 @@
 package postgres
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/uptrace/bun"
 )
 
-const DefaultMMRMultiplier = 2
-const DefaultMMRLambda = 0.5
+// TODO: refactor to a single function used across both document and memory search
 
 // parseJSONQuery recursively parses a JSONQuery and returns a bun.QueryBuilder.
 // TODO: fix the addition of extraneous parentheses in the query
-func parseJSONQuery(
-	qb bun.QueryBuilder,
-	jq *JSONQuery,
-	isOr bool,
-	tablePrefix string,
-) bun.QueryBuilder {
-	var tp string
-	if tablePrefix != "" {
-		tp = tablePrefix + "."
-	}
+func parseJSONQuery(qb bun.QueryBuilder, jq *JSONQuery, isOr bool) bun.QueryBuilder {
 	if jq.JSONPath != "" {
 		path := strings.ReplaceAll(jq.JSONPath, "'", "\"")
 		if isOr {
 			qb = qb.WhereOr(
-				fmt.Sprintf("jsonb_path_exists(%smetadata, ?)", tp),
+				"jsonb_path_exists(m.metadata, ?)",
 				path,
 			)
 		} else {
 			qb = qb.Where(
-				fmt.Sprintf("jsonb_path_exists(%smetadata, ?)", tp),
+				"jsonb_path_exists(m.metadata, ?)",
 				path,
 			)
 		}
@@ -40,7 +29,7 @@ func parseJSONQuery(
 	if len(jq.And) > 0 {
 		qb = qb.WhereGroup(" AND ", func(qq bun.QueryBuilder) bun.QueryBuilder {
 			for _, subQuery := range jq.And {
-				qq = parseJSONQuery(qq, subQuery, false, tablePrefix)
+				qq = parseJSONQuery(qq, subQuery, false)
 			}
 			return qq
 		})
@@ -49,7 +38,7 @@ func parseJSONQuery(
 	if len(jq.Or) > 0 {
 		qb = qb.WhereGroup(" AND ", func(qq bun.QueryBuilder) bun.QueryBuilder {
 			for _, subQuery := range jq.Or {
-				qq = parseJSONQuery(qq, subQuery, true, tablePrefix)
+				qq = parseJSONQuery(qq, subQuery, true)
 			}
 			return qq
 		})
@@ -58,9 +47,41 @@ func parseJSONQuery(
 	return qb
 }
 
-func getAscDesc(asc bool) string {
-	if asc {
-		return "ASC"
+// parseDocumentJSONQuery recursively parses a JSONQuery and returns a bun.QueryBuilder.
+// TODO: fix the addition of extraneous parentheses in the query
+func parseDocumentJSONQuery(qb bun.QueryBuilder, jq *JSONQuery, isOr bool) bun.QueryBuilder {
+	if jq.JSONPath != "" {
+		path := strings.ReplaceAll(jq.JSONPath, "'", "\"")
+		if isOr {
+			qb = qb.WhereOr(
+				"jsonb_path_exists(metadata, ?)",
+				path,
+			)
+		} else {
+			qb = qb.Where(
+				"jsonb_path_exists(metadata, ?)",
+				path,
+			)
+		}
 	}
-	return "DESC"
+
+	if len(jq.And) > 0 {
+		qb = qb.WhereGroup(" AND ", func(qq bun.QueryBuilder) bun.QueryBuilder {
+			for _, subQuery := range jq.And {
+				qq = parseDocumentJSONQuery(qq, subQuery, false)
+			}
+			return qq
+		})
+	}
+
+	if len(jq.Or) > 0 {
+		qb = qb.WhereGroup(" AND ", func(qq bun.QueryBuilder) bun.QueryBuilder {
+			for _, subQuery := range jq.Or {
+				qq = parseDocumentJSONQuery(qq, subQuery, true)
+			}
+			return qq
+		})
+	}
+
+	return qb
 }

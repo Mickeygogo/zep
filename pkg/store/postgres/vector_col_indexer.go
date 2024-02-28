@@ -6,19 +6,24 @@ import (
 	"fmt"
 	"math"
 	"sync"
-	"time"
 
 	"github.com/getzep/zep/pkg/models"
 
 	"github.com/uptrace/bun"
 )
 
-const IndexTimeout = 1 * time.Hour
+// reference: https://github.com/pgvector/pgvector#indexing
+
 const EmbeddingColName = "embedding"
 
 // MinRowsForIndex is the minimum number of rows required to create an index. The pgvector docs
 // recommend creating the index after a representative sample of data is loaded. This is a guesstimate.
 const MinRowsForIndex = 10000
+
+// DefaultDistanceFunction is the default distance function to use for indexing. Using cosine distance
+// function by default in order to support both normalized and non-normalized embeddings.
+// A future improvement would be to use a the inner product distance function for normalized embeddings.
+const DefaultDistanceFunction = "cosine"
 
 // IndexMutexMap stores a mutex for each collection.
 var IndexMutexMap = make(map[string]*sync.Mutex)
@@ -78,13 +83,14 @@ func (vci *VectorColIndex) CalculateProbes() error {
 	return nil
 }
 
-func (vci *VectorColIndex) CreateIndex(_ context.Context, force bool) error {
+func (vci *VectorColIndex) CreateIndex(ctx context.Context, force bool) error {
 	// Check if a mutex already exists for this collection. If not, create one.
 	if _, ok := IndexMutexMap[vci.Collection.Name]; !ok {
 		IndexMutexMap[vci.Collection.Name] = &sync.Mutex{}
 	}
 	// Lock the mutex for this collection.
 	IndexMutexMap[vci.Collection.Name].Lock()
+	defer IndexMutexMap[vci.Collection.Name].Unlock()
 
 	if vci.Collection.DistanceFunction != "cosine" {
 		return fmt.Errorf("only cosine distance function is currently supported")
@@ -102,55 +108,40 @@ func (vci *VectorColIndex) CreateIndex(_ context.Context, force bool) error {
 
 	indexName := fmt.Sprintf("%s_%s_idx", vci.Collection.TableName, vci.ColName)
 
-	// run index creation in a goroutine with IndexTimeout
-	go func() {
-		defer IndexMutexMap[vci.Collection.Name].Unlock()
-		// Create a new context with a timeout
-		ctx, cancel := context.WithTimeout(context.Background(), IndexTimeout)
-		defer cancel()
+	// Drop index if it exists
+	// We're using CONCURRENTLY for both drop and index operations. This means we can't run them in a transaction.
+	_, err := db.ExecContext(
+		ctx,
+		"DROP INDEX CONCURRENTLY IF EXISTS ?",
+		bun.Ident(indexName),
+	)
+	if err != nil {
+		return fmt.Errorf("error dropping index: %w", err)
+	}
 
-		// Drop index if it exists
-		// We're using CONCURRENTLY for both drop and index operations. This means we can't run them in a transaction.
-		_, err := db.ExecContext(
-			ctx,
-			"DROP INDEX CONCURRENTLY IF EXISTS ?",
-			bun.Ident(indexName),
-		)
-		if err != nil {
-			log.Error("error dropping index: ", err)
-			return
-		}
+	// currently only supports cosine distance ops
+	_, err = db.ExecContext(
+		ctx,
+		"CREATE INDEX CONCURRENTLY ON ? USING ivfflat (embedding vector_cosine_ops) WITH (lists = ?)",
+		bun.Ident(vci.Collection.TableName),
+		vci.ListCount,
+	)
+	if err != nil {
+		return fmt.Errorf("error creating index: %w", err)
+	}
 
-		// currently only supports cosine distance ops
-		log.Infof("Starting index creation on %s", vci.Collection.Name)
-		_, err = db.ExecContext(
-			ctx,
-			"CREATE INDEX CONCURRENTLY ON ? USING ivfflat (embedding vector_cosine_ops) WITH (lists = ?)",
-			bun.Ident(vci.Collection.TableName),
-			vci.ListCount,
-		)
-		if err != nil {
-			log.Error("error creating index: ", err)
-			return
-		}
-
-		// Set Collection's IsIndexed flag to true
-		collection, err := vci.appState.DocumentStore.GetCollection(ctx, vci.Collection.Name)
-		if err != nil {
-			log.Error("error getting collection: ", err)
-			return
-		}
-		collection.IsIndexed = true
-		collection.ProbeCount = vci.ProbeCount
-		collection.ListCount = vci.ListCount
-		err = vci.appState.DocumentStore.UpdateCollection(ctx, collection)
-		if err != nil {
-			log.Error("error updating collection: ", err)
-			return
-		}
-
-		log.Infof("Index creation on %s completed successfully", collection.Name)
-	}()
+	// Set Collection's IsIndexed flag to true
+	collection, err := vci.appState.DocumentStore.GetCollection(ctx, vci.Collection.Name)
+	if err != nil {
+		return fmt.Errorf("error getting collection: %w", err)
+	}
+	collection.IsIndexed = true
+	collection.ProbeCount = vci.ProbeCount
+	collection.ListCount = vci.ListCount
+	err = vci.appState.DocumentStore.UpdateCollection(ctx, collection)
+	if err != nil {
+		return fmt.Errorf("error updating collection: %w", err)
+	}
 
 	return nil
 }

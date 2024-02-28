@@ -10,8 +10,5 @@ type AppState struct {
 	LLMClient     ZepLLM
 	MemoryStore   MemoryStore[any]
 	DocumentStore DocumentStore[any]
-	UserStore     UserStore
-	TaskRouter    TaskRouter
-	TaskPublisher TaskPublisher
 	Config        *config.Config
 }
