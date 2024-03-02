@@ -7,6 +7,9 @@ services:
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
+    # 添加数据卷配置
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     build:
       context: .
       dockerfile: Dockerfile.postgres
