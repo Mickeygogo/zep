@@ -75,4 +75,6 @@ services:
 networks:
   zep-network:
     driver: bridge
-
+volumes:
+  postgres-data:
+    driver: local
